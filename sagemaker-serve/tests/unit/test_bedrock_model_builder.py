@@ -326,6 +326,7 @@ class TestGetCheckpointUri:
         body.read.return_value = b"not-json"
         mock_s3 = Mock()
         mock_s3.get_object.return_value = {"Body": body}
+        mock_s3.download_file.side_effect = Exception("not found")
         mock_s3.exceptions = Mock()
         mock_s3.exceptions.NoSuchKey = ClientError
 
@@ -337,7 +338,7 @@ class TestGetCheckpointUri:
         b.boto_session = session
 
         with patch(f"{MODULE}.TrainingJob", type(b.model)):
-            with pytest.raises(ValueError, match="Failed to parse manifest.json"):
+            with pytest.raises(ValueError, match="could not extract from output.tar.gz"):
                 b._get_checkpoint_uri_from_manifest()
 
 
@@ -1150,3 +1151,867 @@ class TestGetS3ArtifactsFromTrainingJob:
             b = BedrockModelBuilder(model=mock_trainer)
 
         assert b.s3_model_artifacts is None
+
+
+# ── _resolve_escrow_identifier ──────────────────────────────────────────────
+
+
+class TestResolveEscrowIdentifier:
+    def test_returns_model_package_arn_when_available(self):
+        b = _builder()
+        b.model_package = Mock()
+        b.model_package.model_package_arn = "arn:aws:sagemaker:us-west-2:123:model-package/pkg"
+        b.s3_model_artifacts = "s3://bucket/path/"
+        assert b._resolve_escrow_identifier() == "arn:aws:sagemaker:us-west-2:123:model-package/pkg"
+
+    def test_returns_s3_uri_when_no_model_package(self):
+        b = _builder()
+        b.model_package = None
+        b.s3_model_artifacts = "s3://bucket/checkpoints/step_4/"
+        assert b._resolve_escrow_identifier() == "s3://bucket/checkpoints/step_4/"
+
+    def test_returns_s3_uri_when_model_package_has_no_arn(self):
+        b = _builder()
+        b.model_package = Mock()
+        b.model_package.model_package_arn = None
+        b.s3_model_artifacts = "s3://bucket/path/"
+        assert b._resolve_escrow_identifier() == "s3://bucket/path/"
+
+    def test_returns_none_when_no_source(self):
+        b = _builder()
+        b.model_package = None
+        b.s3_model_artifacts = None
+        assert b._resolve_escrow_identifier() is None
+
+    def test_prefers_model_package_arn_over_s3(self):
+        b = _builder()
+        b.model_package = Mock()
+        b.model_package.model_package_arn = "arn:pkg"
+        b.s3_model_artifacts = "s3://bucket/path/"
+        assert b._resolve_escrow_identifier() == "arn:pkg"
+
+
+# ── _find_existing_model_by_escrow ──────────────────────────────────────────
+
+
+class TestFindExistingModelByEscrow:
+    def test_returns_arn_when_active_model_found(self):
+        b = _builder()
+        b.boto_session = Mock()
+        tagging_client = Mock()
+        b.boto_session.client.return_value = tagging_client
+        tagging_client.get_resources.return_value = {
+            "ResourceTagMappingList": [
+                {"ResourceARN": "arn:aws:bedrock:us-west-2:123:custom-model/my-model"}
+            ]
+        }
+        b._bedrock_client = Mock()
+        b._bedrock_client.get_custom_model.return_value = {"modelStatus": "Active"}
+
+        result = b._find_existing_model_by_escrow("s3://bucket/path/")
+        assert result == "arn:aws:bedrock:us-west-2:123:custom-model/my-model"
+
+    def test_polls_creating_model_until_active(self):
+        b = _builder()
+        b.boto_session = Mock()
+        tagging_client = Mock()
+        b.boto_session.client.return_value = tagging_client
+        tagging_client.get_resources.return_value = {
+            "ResourceTagMappingList": [
+                {"ResourceARN": "arn:aws:bedrock:us-west-2:123:custom-model/creating-model"}
+            ]
+        }
+        b._bedrock_client = Mock()
+        b._bedrock_client.get_custom_model.side_effect = [
+            {"modelStatus": "Creating"},
+            {"modelStatus": "Creating"},
+            {"modelStatus": "Active"},
+        ]
+
+        with patch(f"{MODULE}.time.sleep"):
+            result = b._find_existing_model_by_escrow("s3://bucket/path/")
+
+        assert result == "arn:aws:bedrock:us-west-2:123:custom-model/creating-model"
+        assert b._bedrock_client.get_custom_model.call_count == 3
+
+    def test_raises_timeout_on_creating_model(self):
+        b = _builder()
+        b.boto_session = Mock()
+        tagging_client = Mock()
+        b.boto_session.client.return_value = tagging_client
+        tagging_client.get_resources.return_value = {
+            "ResourceTagMappingList": [
+                {"ResourceARN": "arn:aws:bedrock:us-west-2:123:custom-model/stuck-model"}
+            ]
+        }
+        b._bedrock_client = Mock()
+        b._bedrock_client.get_custom_model.return_value = {"modelStatus": "Creating"}
+
+        with patch(f"{MODULE}.time.sleep"):
+            with pytest.raises(TimeoutError, match="did not reach Active"):
+                b._find_existing_model_by_escrow("s3://bucket/path/")
+
+    def test_returns_none_on_failed_model(self, caplog):
+        b = _builder()
+        b.boto_session = Mock()
+        tagging_client = Mock()
+        b.boto_session.client.return_value = tagging_client
+        tagging_client.get_resources.return_value = {
+            "ResourceTagMappingList": [
+                {"ResourceARN": "arn:aws:bedrock:us-west-2:123:custom-model/failed-model"}
+            ]
+        }
+        b._bedrock_client = Mock()
+        b._bedrock_client.get_custom_model.return_value = {"modelStatus": "Failed"}
+
+        import logging
+        with caplog.at_level(logging.WARNING):
+            result = b._find_existing_model_by_escrow("s3://bucket/path/")
+
+        assert result is None
+        assert "Failed" in caplog.text
+
+    def test_returns_none_on_api_failure(self, caplog):
+        b = _builder()
+        b.boto_session = Mock()
+        b.boto_session.client.side_effect = Exception("Network error")
+
+        import logging
+        with caplog.at_level(logging.WARNING):
+            result = b._find_existing_model_by_escrow("s3://bucket/path/")
+
+        assert result is None
+        assert "Network error" in caplog.text
+
+    def test_returns_none_when_no_resources_found(self):
+        b = _builder()
+        b.boto_session = Mock()
+        tagging_client = Mock()
+        b.boto_session.client.return_value = tagging_client
+        tagging_client.get_resources.return_value = {"ResourceTagMappingList": []}
+
+        result = b._find_existing_model_by_escrow("s3://bucket/path/")
+        assert result is None
+
+    def test_returns_none_on_get_custom_model_failure(self, caplog):
+        b = _builder()
+        b.boto_session = Mock()
+        tagging_client = Mock()
+        b.boto_session.client.return_value = tagging_client
+        tagging_client.get_resources.return_value = {
+            "ResourceTagMappingList": [
+                {"ResourceARN": "arn:aws:bedrock:us-west-2:123:custom-model/model"}
+            ]
+        }
+        b._bedrock_client = Mock()
+        b._bedrock_client.get_custom_model.side_effect = Exception("Access denied")
+
+        import logging
+        with caplog.at_level(logging.WARNING):
+            result = b._find_existing_model_by_escrow("s3://bucket/path/")
+
+        assert result is None
+        assert "Access denied" in caplog.text
+
+
+# ── _find_or_create_model ───────────────────────────────────────────────────
+
+
+class TestFindOrCreateModel:
+    def test_skips_lookup_when_skip_model_reuse_true(self):
+        b = _builder()
+        b.model_package = None
+        b.s3_model_artifacts = "s3://bucket/path/"
+        b._is_rmp = False
+        b._bedrock_client = Mock()
+        b._bedrock_client.create_custom_model.return_value = {"modelArn": "arn:new-model"}
+        b._bedrock_client.get_custom_model.return_value = {"modelStatus": "Active"}
+
+        with patch.object(b, "_find_existing_model_by_escrow") as mock_find:
+            result = b._find_or_create_model(
+                custom_model_name="my-model",
+                role_arn="arn:role",
+                model_tags=None,
+                skip_model_reuse=True,
+            )
+
+        mock_find.assert_not_called()
+        assert result == "arn:new-model"
+
+    def test_reuses_existing_model_when_found(self):
+        b = _builder()
+        b.model_package = None
+        b.s3_model_artifacts = "s3://bucket/path/"
+        b._is_rmp = False
+        b._bedrock_client = Mock()
+
+        with patch.object(
+            b, "_find_existing_model_by_escrow", return_value="arn:existing-model"
+        ):
+            result = b._find_or_create_model(
+                custom_model_name="my-model",
+                role_arn="arn:role",
+                model_tags=None,
+                skip_model_reuse=False,
+            )
+
+        assert result == "arn:existing-model"
+        b._bedrock_client.create_custom_model.assert_not_called()
+
+    def test_always_applies_escrow_tag_on_new_model_creation(self):
+        """Property 6: Escrow Tag Always Applied on Model Creation.
+
+        Validates: Requirements 5.6, 8.2
+        """
+        b = _builder()
+        b.model_package = None
+        b.s3_model_artifacts = "s3://bucket/path/"
+        b._is_rmp = False
+        b._bedrock_client = Mock()
+        b._bedrock_client.create_custom_model.return_value = {"modelArn": "arn:new-model"}
+        b._bedrock_client.get_custom_model.return_value = {"modelStatus": "Active"}
+
+        with patch.object(b, "_find_existing_model_by_escrow", return_value=None):
+            b._find_or_create_model(
+                custom_model_name="my-model",
+                role_arn="arn:role",
+                model_tags=None,
+                skip_model_reuse=False,
+            )
+
+        call_kwargs = b._bedrock_client.create_custom_model.call_args[1]
+        tags = call_kwargs["modelTags"]
+        escrow_tags = [t for t in tags if t["key"] == "sagemaker.amazonaws.com/forge/escrow-uri"]
+        assert len(escrow_tags) == 1
+        assert escrow_tags[0]["value"] == "s3://bucket/path/"
+
+    def test_escrow_tag_applied_even_when_skip_model_reuse_true(self):
+        """Property 6: Escrow tag applied regardless of skip_model_reuse.
+
+        Validates: Requirements 5.6, 8.2
+        """
+        b = _builder()
+        b.model_package = None
+        b.s3_model_artifacts = "s3://bucket/path/"
+        b._is_rmp = False
+        b._bedrock_client = Mock()
+        b._bedrock_client.create_custom_model.return_value = {"modelArn": "arn:new-model"}
+        b._bedrock_client.get_custom_model.return_value = {"modelStatus": "Active"}
+
+        b._find_or_create_model(
+            custom_model_name="my-model",
+            role_arn="arn:role",
+            model_tags=None,
+            skip_model_reuse=True,
+        )
+
+        call_kwargs = b._bedrock_client.create_custom_model.call_args[1]
+        tags = call_kwargs["modelTags"]
+        escrow_tags = [t for t in tags if t["key"] == "sagemaker.amazonaws.com/forge/escrow-uri"]
+        assert len(escrow_tags) == 1
+        assert escrow_tags[0]["value"] == "s3://bucket/path/"
+
+    def test_escrow_tag_does_not_duplicate_existing_tags(self):
+        b = _builder()
+        b.model_package = None
+        b.s3_model_artifacts = "s3://bucket/path/"
+        b._is_rmp = False
+        b._bedrock_client = Mock()
+        b._bedrock_client.create_custom_model.return_value = {"modelArn": "arn:new-model"}
+        b._bedrock_client.get_custom_model.return_value = {"modelStatus": "Active"}
+
+        existing_tags = [
+            {"key": "team", "value": "ml"},
+            {"key": "sagemaker.amazonaws.com/forge/escrow-uri", "value": "old-value"},
+        ]
+
+        with patch.object(b, "_find_existing_model_by_escrow", return_value=None):
+            b._find_or_create_model(
+                custom_model_name="my-model",
+                role_arn="arn:role",
+                model_tags=existing_tags,
+                skip_model_reuse=False,
+            )
+
+        call_kwargs = b._bedrock_client.create_custom_model.call_args[1]
+        tags = call_kwargs["modelTags"]
+        escrow_tags = [t for t in tags if t["key"] == "sagemaker.amazonaws.com/forge/escrow-uri"]
+        assert len(escrow_tags) == 1
+        assert escrow_tags[0]["value"] == "s3://bucket/path/"
+        team_tags = [t for t in tags if t["key"] == "team"]
+        assert len(team_tags) == 1
+
+    def test_creates_nova_model_with_s3_source(self):
+        b = _builder()
+        b.model_package = None
+        b.s3_model_artifacts = "s3://bucket/ckpt/"
+        b._is_rmp = False
+        b._bedrock_client = Mock()
+        b._bedrock_client.create_custom_model.return_value = {"modelArn": "arn:model"}
+        b._bedrock_client.get_custom_model.return_value = {"modelStatus": "Active"}
+
+        with patch.object(b, "_find_existing_model_by_escrow", return_value=None):
+            result = b._find_or_create_model(
+                custom_model_name="my-nova",
+                role_arn="arn:role",
+                model_tags=None,
+                skip_model_reuse=False,
+            )
+
+        assert result == "arn:model"
+        call_kwargs = b._bedrock_client.create_custom_model.call_args[1]
+        assert call_kwargs["modelSourceConfig"] == {"s3DataSource": {"s3Uri": "s3://bucket/ckpt/"}}
+        assert call_kwargs["modelName"] == "my-nova"
+        assert call_kwargs["roleArn"] == "arn:role"
+
+
+# ── _check_existing_deployment ──────────────────────────────────────────────
+
+
+class TestCheckExistingDeployment:
+    def test_returns_arn_on_exact_pt_name_match(self):
+        b = _builder()
+        b._bedrock_client = Mock()
+        b._bedrock_client.list_provisioned_model_throughputs.return_value = {
+            "provisionedModelSummaries": [
+                {
+                    "provisionedModelName": "my-pt-deployment",
+                    "provisionedModelArn": "arn:aws:bedrock:us-west-2:123:provisioned-model/my-pt",
+                },
+            ]
+        }
+
+        result = b._check_existing_deployment("my-pt-deployment", is_provisioned=True)
+        assert result == "arn:aws:bedrock:us-west-2:123:provisioned-model/my-pt"
+        b._bedrock_client.list_provisioned_model_throughputs.assert_called_once_with(
+            nameContains="my-pt-deployment"
+        )
+
+    def test_returns_none_on_partial_match_only(self):
+        b = _builder()
+        b._bedrock_client = Mock()
+        b._bedrock_client.list_provisioned_model_throughputs.return_value = {
+            "provisionedModelSummaries": [
+                {
+                    "provisionedModelName": "my-pt-deployment-v2",
+                    "provisionedModelArn": "arn:aws:bedrock:us-west-2:123:provisioned-model/v2",
+                },
+                {
+                    "provisionedModelName": "my-pt-deployment-old",
+                    "provisionedModelArn": "arn:aws:bedrock:us-west-2:123:provisioned-model/old",
+                },
+            ]
+        }
+
+        result = b._check_existing_deployment("my-pt-deployment", is_provisioned=True)
+        assert result is None
+
+    def test_returns_none_and_logs_warning_on_api_failure(self, caplog):
+        b = _builder()
+        b._bedrock_client = Mock()
+        b._bedrock_client.list_provisioned_model_throughputs.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "Not authorized"}},
+            "ListProvisionedModelThroughputs",
+        )
+
+        import logging
+        with caplog.at_level(logging.WARNING):
+            result = b._check_existing_deployment("my-pt", is_provisioned=True)
+
+        assert result is None
+        assert "Could not check for existing deployment" in caplog.text
+
+    def test_returns_arn_on_exact_od_name_match(self):
+        b = _builder()
+        b._bedrock_client = Mock()
+        b._bedrock_client.list_custom_model_deployments.return_value = {
+            "customModelDeploymentSummaries": [
+                {
+                    "customModelDeploymentName": "my-od-deploy",
+                    "customModelDeploymentArn": "arn:aws:bedrock:us-west-2:123:deployment/od",
+                },
+            ]
+        }
+
+        result = b._check_existing_deployment("my-od-deploy", is_provisioned=False)
+        assert result == "arn:aws:bedrock:us-west-2:123:deployment/od"
+
+    def test_returns_none_when_no_summaries(self):
+        b = _builder()
+        b._bedrock_client = Mock()
+        b._bedrock_client.list_provisioned_model_throughputs.return_value = {
+            "provisionedModelSummaries": []
+        }
+
+        result = b._check_existing_deployment("nonexistent", is_provisioned=True)
+        assert result is None
+
+
+# ── _handle_existing_deployment ─────────────────────────────────────────────
+
+
+class TestHandleExistingDeployment:
+    def test_raises_runtime_error_with_fail_if_exists(self):
+        from sagemaker.serve.bedrock_target import DeploymentMode
+
+        b = _builder()
+        with pytest.raises(RuntimeError, match="already exists") as exc_info:
+            b._handle_existing_deployment(
+                existing_arn="arn:aws:bedrock:us-west-2:123:provisioned-model/existing",
+                deployment_mode=DeploymentMode.FAIL_IF_EXISTS,
+                new_model_arn="arn:aws:bedrock:us-west-2:123:custom-model/new",
+                deployment_name="my-deployment",
+                is_provisioned=True,
+            )
+        assert "UPDATE_IF_EXISTS" in str(exc_info.value)
+        assert "arn:aws:bedrock:us-west-2:123:provisioned-model/existing" in str(exc_info.value)
+
+    def test_calls_update_provisioned_model_throughput_with_update_if_exists(self):
+        from sagemaker.serve.bedrock_target import DeploymentMode
+
+        b = _builder()
+        b._bedrock_client = Mock()
+
+        result = b._handle_existing_deployment(
+            existing_arn="arn:aws:bedrock:us-west-2:123:provisioned-model/existing",
+            deployment_mode=DeploymentMode.UPDATE_IF_EXISTS,
+            new_model_arn="arn:aws:bedrock:us-west-2:123:custom-model/new",
+            deployment_name="my-deployment",
+            is_provisioned=True,
+        )
+
+        b._bedrock_client.update_provisioned_model_throughput.assert_called_once_with(
+            provisionedModelId="arn:aws:bedrock:us-west-2:123:provisioned-model/existing",
+            desiredModelId="arn:aws:bedrock:us-west-2:123:custom-model/new",
+        )
+        assert result["provisionedModelArn"] == "arn:aws:bedrock:us-west-2:123:provisioned-model/existing"
+        assert result["customModelArn"] == "arn:aws:bedrock:us-west-2:123:custom-model/new"
+        assert result["status"] == "Updating"
+
+    def test_raises_value_error_with_update_if_exists_on_non_pt(self):
+        from sagemaker.serve.bedrock_target import DeploymentMode
+
+        b = _builder()
+        with pytest.raises(ValueError, match="only supported for Provisioned Throughput"):
+            b._handle_existing_deployment(
+                existing_arn="arn:aws:bedrock:us-west-2:123:deployment/od",
+                deployment_mode=DeploymentMode.UPDATE_IF_EXISTS,
+                new_model_arn="arn:aws:bedrock:us-west-2:123:custom-model/new",
+                deployment_name="my-od-deployment",
+                is_provisioned=False,
+            )
+
+    def test_raises_runtime_error_when_update_call_fails(self):
+        from sagemaker.serve.bedrock_target import DeploymentMode
+
+        b = _builder()
+        b._bedrock_client = Mock()
+        b._bedrock_client.update_provisioned_model_throughput.side_effect = ClientError(
+            {"Error": {"Code": "ValidationException", "Message": "Model not compatible"}},
+            "UpdateProvisionedModelThroughput",
+        )
+
+        with pytest.raises(RuntimeError, match="Failed to update deployment 'my-pt'"):
+            b._handle_existing_deployment(
+                existing_arn="arn:aws:bedrock:us-west-2:123:provisioned-model/existing",
+                deployment_mode=DeploymentMode.UPDATE_IF_EXISTS,
+                new_model_arn="arn:aws:bedrock:us-west-2:123:custom-model/new",
+                deployment_name="my-pt",
+                is_provisioned=True,
+            )
+
+# ── _create_and_poll_provisioned_throughput ──────────────────────────────────
+
+
+class TestCreateAndPollProvisionedThroughput:
+    def test_returns_result_on_immediate_in_service(self):
+        b = _builder()
+        b._bedrock_client = Mock()
+        b._bedrock_client.create_provisioned_model_throughput.return_value = {
+            "provisionedModelArn": "arn:aws:bedrock:us-west-2:123:provisioned-model/my-pt"
+        }
+        b._bedrock_client.get_provisioned_model_throughput.return_value = {
+            "status": "InService"
+        }
+
+        result = b._create_and_poll_provisioned_throughput(
+            model_arn="arn:aws:bedrock:us-west-2:123:custom-model/m",
+            deployment_name="my-pt",
+            units=2,
+            commitment_duration="OneMonth",
+        )
+
+        b._bedrock_client.create_provisioned_model_throughput.assert_called_once_with(
+            modelId="arn:aws:bedrock:us-west-2:123:custom-model/m",
+            provisionedModelName="my-pt",
+            modelUnits=2,
+            commitmentDuration="OneMonth",
+        )
+        assert result["provisionedModelArn"] == "arn:aws:bedrock:us-west-2:123:provisioned-model/my-pt"
+        assert result["customModelArn"] == "arn:aws:bedrock:us-west-2:123:custom-model/m"
+        assert result["status"] == "InService"
+
+    def test_raises_runtime_error_on_failed_status(self):
+        b = _builder()
+        b._bedrock_client = Mock()
+        b._bedrock_client.create_provisioned_model_throughput.return_value = {
+            "provisionedModelArn": "arn:pt"
+        }
+        b._bedrock_client.get_provisioned_model_throughput.return_value = {
+            "status": "Failed",
+            "failureMessage": "Capacity unavailable",
+        }
+
+        with pytest.raises(RuntimeError, match="Capacity unavailable"):
+            b._create_and_poll_provisioned_throughput(
+                model_arn="arn:model",
+                deployment_name="my-pt",
+                units=1,
+                commitment_duration=None,
+            )
+
+    def test_raises_runtime_error_on_timeout(self):
+        b = _builder()
+        b._bedrock_client = Mock()
+        b._bedrock_client.create_provisioned_model_throughput.return_value = {
+            "provisionedModelArn": "arn:pt"
+        }
+        b._bedrock_client.get_provisioned_model_throughput.return_value = {
+            "status": "Creating"
+        }
+
+        with patch(f"{MODULE}.time.sleep"):
+            with pytest.raises(RuntimeError, match="Timed out"):
+                b._create_and_poll_provisioned_throughput(
+                    model_arn="arn:model",
+                    deployment_name="my-pt",
+                    units=1,
+                    commitment_duration=None,
+                    poll_interval=1,
+                    max_wait=2,
+                )
+
+    def test_no_commitment_duration_omitted_from_params(self):
+        b = _builder()
+        b._bedrock_client = Mock()
+        b._bedrock_client.create_provisioned_model_throughput.return_value = {
+            "provisionedModelArn": "arn:pt"
+        }
+        b._bedrock_client.get_provisioned_model_throughput.return_value = {
+            "status": "InService"
+        }
+
+        b._create_and_poll_provisioned_throughput(
+            model_arn="arn:model",
+            deployment_name="my-pt",
+            units=1,
+            commitment_duration=None,
+        )
+
+        call_kwargs = b._bedrock_client.create_provisioned_model_throughput.call_args[1]
+        assert "commitmentDuration" not in call_kwargs
+
+    def test_polls_creating_then_in_service(self):
+        b = _builder()
+        b._bedrock_client = Mock()
+        b._bedrock_client.create_provisioned_model_throughput.return_value = {
+            "provisionedModelArn": "arn:pt"
+        }
+        b._bedrock_client.get_provisioned_model_throughput.side_effect = [
+            {"status": "Creating"},
+            {"status": "Creating"},
+            {"status": "InService"},
+        ]
+
+        with patch(f"{MODULE}.time.sleep"):
+            result = b._create_and_poll_provisioned_throughput(
+                model_arn="arn:model",
+                deployment_name="my-pt",
+                units=1,
+                commitment_duration=None,
+                poll_interval=1,
+                max_wait=10,
+            )
+
+        assert result["status"] == "InService"
+        assert b._bedrock_client.get_provisioned_model_throughput.call_count == 3
+
+
+# ── deploy() with target parameter (PT and OD routing) ──────────────────────
+
+
+class TestDeployWithTarget:
+    @pytest.fixture(autouse=True)
+    def _stub_role_validation(self):
+        with patch(
+            f"{MODULE}.resolve_and_validate_role",
+            side_effect=lambda provided_role, **kwargs: provided_role or "auto-role",
+        ):
+            yield
+
+    def test_provisioned_mode_creates_pt_deployment(self):
+        """deploy(target=BedrockTarget(mode="provisioned")) creates PT deployment.
+
+        Validates: Requirements 4.1
+        """
+        from sagemaker.serve.bedrock_target import BedrockTarget, ProvisionedConfig
+
+        b = _builder()
+        b.model_package = None
+        b.s3_model_artifacts = "s3://bucket/ckpt/"
+
+        with patch.object(
+            b, "_find_or_create_model", return_value="arn:aws:bedrock:us-west-2:123:custom-model/m"
+        ) as mock_find, patch.object(
+            b, "_check_existing_deployment", return_value=None
+        ) as mock_check, patch.object(
+            b,
+            "_create_and_poll_provisioned_throughput",
+            return_value={
+                "provisionedModelArn": "arn:aws:bedrock:us-west-2:123:provisioned-model/pt",
+                "modelArn": "arn:aws:bedrock:us-west-2:123:provisioned-model/pt",
+                "customModelArn": "arn:aws:bedrock:us-west-2:123:custom-model/m",
+                "status": "InService",
+            },
+        ) as mock_create_pt:
+            result = b.deploy(
+                custom_model_name="my-model",
+                role_arn="arn:role",
+                target=BedrockTarget(mode="provisioned", config=ProvisionedConfig(units=2)),
+            )
+
+        mock_find.assert_called_once()
+        mock_check.assert_called_once_with("my-model-pt", is_provisioned=True)
+        mock_create_pt.assert_called_once_with(
+            model_arn="arn:aws:bedrock:us-west-2:123:custom-model/m",
+            deployment_name="my-model-pt",
+            units=2,
+            commitment_duration=None,
+        )
+        assert result["provisionedModelArn"] == "arn:aws:bedrock:us-west-2:123:provisioned-model/pt"
+        assert result["status"] == "InService"
+
+    def test_on_demand_mode_uses_od_path(self):
+        """deploy(target=BedrockTarget(mode="on_demand")) uses OD path.
+
+        Validates: Requirements 4.2
+        """
+        from sagemaker.serve.bedrock_target import BedrockTarget
+
+        b = _builder()
+        b.model_package = None
+        b.s3_model_artifacts = "s3://bucket/ckpt/"
+
+        with patch.object(
+            b, "_find_or_create_model", return_value="arn:aws:bedrock:us-west-2:123:custom-model/m"
+        ), patch.object(
+            b, "_check_existing_deployment", return_value=None
+        ), patch.object(
+            b,
+            "create_deployment",
+            return_value={"customModelDeploymentArn": "arn:dep"},
+        ) as mock_deploy:
+            result = b.deploy(
+                custom_model_name="my-model",
+                role_arn="arn:role",
+                target=BedrockTarget(mode="on_demand"),
+            )
+
+        mock_deploy.assert_called_once_with(
+            model_arn="arn:aws:bedrock:us-west-2:123:custom-model/m",
+            deployment_name="my-model-deployment",
+        )
+        assert result["customModelDeploymentArn"] == "arn:dep"
+        assert result["customModelArn"] == "arn:aws:bedrock:us-west-2:123:custom-model/m"
+
+    def test_deploy_without_target_backward_compat(self):
+        """deploy() without target maintains backward compat.
+
+        Validates: Requirements 4.3
+        """
+        c = _make_container(recipe_name="nova-micro")
+        b = _builder()
+        b.model_package = _make_model_package(c)
+        b.s3_model_artifacts = "s3://b/k"
+        b._bedrock_client = Mock()
+        b._bedrock_client.create_custom_model.return_value = {"modelArn": "arn:m"}
+        b._bedrock_client.get_custom_model.return_value = {"modelStatus": "Active"}
+        b._bedrock_client.create_custom_model_deployment.return_value = {
+            "customModelDeploymentArn": "arn:dep"
+        }
+        b._bedrock_client.get_custom_model_deployment.return_value = {"status": "Active"}
+
+        result = b.deploy(custom_model_name="m", role_arn="r")
+
+        b._bedrock_client.create_custom_model.assert_called_once()
+        b._bedrock_client.create_custom_model_deployment.assert_called_once()
+        assert result["customModelDeploymentArn"] == "arn:dep"
+
+    def test_deploy_return_value_contains_custom_model_arn_provisioned(self):
+        """Property 7: Deploy Return Value Contains customModelArn (provisioned).
+
+        Validates: Requirements 7.4
+        """
+        from sagemaker.serve.bedrock_target import BedrockTarget, ProvisionedConfig
+
+        b = _builder()
+        b.model_package = None
+        b.s3_model_artifacts = "s3://bucket/ckpt/"
+
+        with patch.object(
+            b, "_find_or_create_model", return_value="arn:aws:bedrock:us-west-2:123:custom-model/m"
+        ), patch.object(
+            b, "_check_existing_deployment", return_value=None
+        ), patch.object(
+            b,
+            "_create_and_poll_provisioned_throughput",
+            return_value={
+                "provisionedModelArn": "arn:pt",
+                "modelArn": "arn:pt",
+                "customModelArn": "arn:aws:bedrock:us-west-2:123:custom-model/m",
+                "status": "InService",
+            },
+        ):
+            result = b.deploy(
+                custom_model_name="my-model",
+                role_arn="arn:role",
+                target=BedrockTarget(mode="provisioned"),
+            )
+
+        assert "customModelArn" in result
+        assert result["customModelArn"] == "arn:aws:bedrock:us-west-2:123:custom-model/m"
+
+    def test_deploy_return_value_contains_custom_model_arn_on_demand(self):
+        """Property 7: Deploy Return Value Contains customModelArn (on_demand).
+
+        Validates: Requirements 7.4
+        """
+        from sagemaker.serve.bedrock_target import BedrockTarget
+
+        b = _builder()
+        b.model_package = None
+        b.s3_model_artifacts = "s3://bucket/ckpt/"
+
+        with patch.object(
+            b, "_find_or_create_model", return_value="arn:aws:bedrock:us-west-2:123:custom-model/m"
+        ), patch.object(
+            b, "_check_existing_deployment", return_value=None
+        ), patch.object(
+            b,
+            "create_deployment",
+            return_value={"customModelDeploymentArn": "arn:dep"},
+        ):
+            result = b.deploy(
+                custom_model_name="my-model",
+                role_arn="arn:role",
+                target=BedrockTarget(mode="on_demand"),
+            )
+
+        assert "customModelArn" in result
+        assert result["customModelArn"] == "arn:aws:bedrock:us-west-2:123:custom-model/m"
+
+    def test_deploy_with_update_if_exists_routes_to_update(self):
+        """deploy() with UPDATE_IF_EXISTS routes to update path.
+
+        Validates: Requirements 4.7, 7.3
+        """
+        from sagemaker.serve.bedrock_target import (
+            BedrockTarget,
+            DeploymentMode,
+            ProvisionedConfig,
+        )
+
+        b = _builder()
+        b.model_package = None
+        b.s3_model_artifacts = "s3://bucket/ckpt/"
+
+        with patch.object(
+            b, "_find_or_create_model", return_value="arn:aws:bedrock:us-west-2:123:custom-model/new"
+        ), patch.object(
+            b,
+            "_check_existing_deployment",
+            return_value="arn:aws:bedrock:us-west-2:123:provisioned-model/existing",
+        ), patch.object(
+            b,
+            "_handle_existing_deployment",
+            return_value={
+                "provisionedModelArn": "arn:aws:bedrock:us-west-2:123:provisioned-model/existing",
+                "customModelArn": "arn:aws:bedrock:us-west-2:123:custom-model/new",
+                "status": "Updating",
+            },
+        ) as mock_handle:
+            result = b.deploy(
+                custom_model_name="my-model",
+                role_arn="arn:role",
+                target=BedrockTarget(
+                    mode="provisioned",
+                    config=ProvisionedConfig(deployment_mode=DeploymentMode.UPDATE_IF_EXISTS),
+                ),
+            )
+
+        mock_handle.assert_called_once_with(
+            existing_arn="arn:aws:bedrock:us-west-2:123:provisioned-model/existing",
+            deployment_mode=DeploymentMode.UPDATE_IF_EXISTS,
+            new_model_arn="arn:aws:bedrock:us-west-2:123:custom-model/new",
+            deployment_name="my-model-pt",
+            is_provisioned=True,
+        )
+        assert result["status"] == "Updating"
+        assert result["customModelArn"] == "arn:aws:bedrock:us-west-2:123:custom-model/new"
+
+    def test_provisioned_mode_with_custom_deployment_name(self):
+        """deploy() with target and deployment_name uses the custom name.
+
+        Validates: Requirements 4.1
+        """
+        from sagemaker.serve.bedrock_target import BedrockTarget
+
+        b = _builder()
+        b.model_package = None
+        b.s3_model_artifacts = "s3://bucket/ckpt/"
+
+        with patch.object(
+            b, "_find_or_create_model", return_value="arn:model"
+        ), patch.object(
+            b, "_check_existing_deployment", return_value=None
+        ) as mock_check, patch.object(
+            b,
+            "_create_and_poll_provisioned_throughput",
+            return_value={
+                "provisionedModelArn": "arn:pt",
+                "modelArn": "arn:pt",
+                "customModelArn": "arn:model",
+                "status": "InService",
+            },
+        ) as mock_create_pt:
+            b.deploy(
+                custom_model_name="my-model",
+                role_arn="arn:role",
+                deployment_name="custom-pt-name",
+                target=BedrockTarget(mode="provisioned"),
+            )
+
+        mock_check.assert_called_once_with("custom-pt-name", is_provisioned=True)
+        mock_create_pt.assert_called_once_with(
+            model_arn="arn:model",
+            deployment_name="custom-pt-name",
+            units=1,
+            commitment_duration=None,
+        )
+
+    def test_missing_custom_model_name_raises_with_target(self):
+        """deploy() with target but no custom_model_name raises ValueError.
+
+        Validates: Requirements 4.1
+        """
+        from sagemaker.serve.bedrock_target import BedrockTarget
+
+        b = _builder()
+        b.model_package = None
+        b.s3_model_artifacts = "s3://bucket/ckpt/"
+
+        with pytest.raises(ValueError, match="custom_model_name is required"):
+            b.deploy(
+                role_arn="arn:role",
+                target=BedrockTarget(mode="provisioned"),
+            )

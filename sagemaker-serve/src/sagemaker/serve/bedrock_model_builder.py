@@ -20,6 +20,13 @@ import logging
 from datetime import datetime, timezone
 
 from sagemaker.serve.utils.model_package_utils import is_restricted_model_package
+from sagemaker.serve.bedrock_target import (
+    ESCROW_URI_TAG_KEY,
+    BedrockTarget,
+    DeploymentMode,
+    normalize_escrow_tag_value,
+)
+
 from typing import Optional, Dict, Any, Union
 from urllib.parse import urlparse
 
@@ -168,43 +175,50 @@ class BedrockModelBuilder:
         client_request_token: Optional[str] = None,
         imported_model_kms_key_id: Optional[str] = None,
         deployment_name: Optional[str] = None,
+        target: Optional["BedrockTarget"] = None,
+        skip_model_reuse: bool = False,
     ) -> Dict[str, Any]:
         """Deploy the model to Bedrock.
 
-        Automatically detects if the model is a Nova model and uses the appropriate
-        Bedrock API (create_custom_model for Nova, create_model_import_job for OSS).
-        For Nova models, creates a custom model deployment and polls until active.
-        For OSS models, creates a model import job and polls until complete. Once
-        deploy() returns, the model is ready for on-demand inference. For provisioned
-        throughput, use the separate create_provisioned_throughput() method.
+        When ``target`` is provided, uses the integrated target-based deployment flow:
+        escrow-based model reuse, deployment existence checks, and routing to either
+        provisioned throughput or on-demand based on target.mode.
 
-        When initialized with a direct S3 URI (no model package), the behavior
-        depends on the parameters:
-        - If ``custom_model_name`` is provided, uses the Nova create_custom_model
-          + create_custom_model_deployment path.
-        - Otherwise, uses the OSS create_model_import_job path.
+        When ``target`` is None (default), uses the legacy flow which automatically
+        detects Nova vs OSS models and deploys to on-demand.
 
         Args:
-            job_name: Name for the model import job (OSS models only).
-            imported_model_name: Name for the imported model (OSS models only).
-            custom_model_name: Name for the custom model (Nova models, or direct
-                S3 URI deployments that should use the custom model path).
+            job_name: Name for the model import job (OSS models, legacy flow only).
+            imported_model_name: Name for the imported model (OSS models, legacy flow only).
+            custom_model_name: Name for the custom model. Required when using target.
             role_arn: IAM role ARN with permissions for Bedrock operations.
-            job_tags: Tags for the import job (OSS models only).
-            imported_model_tags: Tags for the imported model (OSS models only).
-            model_tags: Tags for the custom model (Nova models only).
-            client_request_token: Unique token for idempotency (OSS models only).
-            imported_model_kms_key_id: KMS key ID for encryption (OSS models only).
-            deployment_name: Name for the deployment (Nova models only). If not provided,
-                defaults to custom_model_name suffixed with '-deployment'.
+                If not provided, auto-resolves a least-privilege Bedrock role.
+            job_tags: Tags for the import job (OSS models, legacy flow only).
+            imported_model_tags: Tags for the imported model (OSS models, legacy flow only).
+            model_tags: Tags for the custom model.
+            client_request_token: Unique token for idempotency (OSS models, legacy flow only).
+            imported_model_kms_key_id: KMS key ID for encryption (OSS models, legacy flow only).
+            deployment_name: Name for the deployment. Auto-generated if not provided.
+            target: Deployment target configuration. When provided, enables escrow-based
+                model reuse and routes to provisioned throughput or on-demand based on
+                target.mode. See BedrockTarget for details.
+            skip_model_reuse: If True, skip escrow tag-based model lookup and always
+                create a new custom model. The escrow tag is still applied to the new
+                model for future reuse. Defaults to False.
 
         Returns:
-            For Nova models: the create_custom_model_deployment response.
-            For OSS models: the completed get_model_import_job response.
+            When target is provided with mode="provisioned":
+                Dict with provisionedModelArn, modelArn, customModelArn, status.
+            When target is provided with mode="on_demand":
+                Dict with customModelDeploymentArn, customModelArn, and deployment details.
+            When target is None (legacy Nova flow):
+                The create_custom_model_deployment response.
+            When target is None (legacy OSS flow):
+                The completed get_model_import_job response.
 
         Raises:
             ValueError: If no model source is available or required parameters are missing.
-            RuntimeError: If the import job or deployment fails or times out.
+            RuntimeError: If deployment fails, times out, or conflicts with FAIL_IF_EXISTS.
         """
         if not self.model_package and not self.s3_model_artifacts:
             raise ValueError(
@@ -220,66 +234,91 @@ class BedrockModelBuilder:
         # Direct S3 URI without model package: use Nova path if custom_model_name
         # is provided, otherwise fall through to OSS import path.
         if not self.model_package and self.s3_model_artifacts:
-            if custom_model_name:
+            if custom_model_name or target is not None:
                 is_nova = True
 
         if self._is_rmp or is_nova:
             if not custom_model_name:
                 raise ValueError("custom_model_name is required for Nova model deployment.")
-            # Resolve and validate the Bedrock role: the provided role_arn if given,
-            # otherwise the caller's own identity role. A RoleValidationError
-            # explains remediation if the resolved role is insufficient.
+
             role_arn = resolve_and_validate_role(
                 provided_role=role_arn,
                 role_type="bedrock",
                 sagemaker_session=self.sagemaker_session,
             )
 
-            if self._is_rmp:
-                params = {
-                    "modelName": custom_model_name,
-                    "customModelDataSource": {
-                        "modelPackageArnDataSource": {
-                            "modelPackageArn": self.model_package.model_package_arn
-                        }
-                    },
-                    "roleArn": role_arn,
-                }
+            is_provisioned = target.mode == "provisioned" if target else False
+            config = target.config if target and is_provisioned else None
+            effective_skip = skip_model_reuse or (target.skip_model_reuse if target else False)
+            deployment_mode = config.deployment_mode if config else DeploymentMode.FAIL_IF_EXISTS
+
+            model_arn = self._find_or_create_model(
+                custom_model_name=custom_model_name,
+                role_arn=role_arn,
+                model_tags=model_tags,
+                skip_model_reuse=effective_skip,
+            )
+
+            if deployment_name:
+                deploy_name = deployment_name
+            elif is_provisioned:
+                deploy_name = f"{custom_model_name}-pt"
             else:
-                params = {
-                    "modelName": custom_model_name,
-                    "modelSourceConfig": {"s3DataSource": {"s3Uri": self.s3_model_artifacts}},
-                    "roleArn": role_arn,
-                }
-            if model_tags:
-                params["modelTags"] = model_tags
-            params = {k: v for k, v in params.items() if v is not None}
+                deploy_name = f"{custom_model_name}-deployment"
 
-            logger.info("Creating custom model %s for Nova deployment", custom_model_name)
-            create_response = self._get_bedrock_client().create_custom_model(**params)
-            _log_bedrock_api_call("create_custom_model", params, create_response)
+            if target is not None:
+                existing_arn = self._check_existing_deployment(
+                    deploy_name, is_provisioned=is_provisioned
+                )
+                if existing_arn:
+                    return self._handle_existing_deployment(
+                        existing_arn=existing_arn,
+                        deployment_mode=deployment_mode,
+                        new_model_arn=model_arn,
+                        deployment_name=deploy_name,
+                        is_provisioned=is_provisioned,
+                    )
 
-            model_arn = create_response.get("modelArn")
-            deploy_name = deployment_name or f"{custom_model_name}-deployment"
-            return self.create_deployment(model_arn=model_arn, deployment_name=deploy_name)
+            if is_provisioned:
+                return self._create_and_poll_provisioned_throughput(
+                    model_arn=model_arn,
+                    deployment_name=deploy_name,
+                    units=config.units,
+                    commitment_duration=config.commitment_duration,
+                )
+
+            response = self.create_deployment(model_arn=model_arn, deployment_name=deploy_name)
+            if target is not None and "customModelArn" not in response:
+                response["customModelArn"] = model_arn
+            return response
         else:
-            # Resolve and validate the Bedrock role: the provided role_arn if given,
-            # otherwise the caller's own identity role. A RoleValidationError
-            # explains remediation if the resolved role is insufficient.
+            # OSS import path
+            if target is not None and target.mode == "provisioned":
+                raise ValueError(
+                    "Provisioned Throughput is not supported for OSS models imported via "
+                    "create_model_import_job. Only models created via CreateCustomModel "
+                    "(Nova or RMP-based) support Provisioned Throughput. "
+                    "For OSS models, use mode='on_demand' or deploy without a target."
+                )
+            if target is not None:
+                raise ValueError(
+                    "BedrockTarget with mode='on_demand' is not supported for OSS model import. "
+                    "OSS models are deployed on-demand by default. "
+                    "Use deploy() without target, or provide custom_model_name "
+                    "to use the Nova/RMP CreateCustomModel path."
+                )
+
             role_arn = resolve_and_validate_role(
                 provided_role=role_arn,
                 role_type="bedrock",
                 sagemaker_session=self.sagemaker_session,
             )
             model_data_source = {"s3DataSource": {"s3Uri": self.s3_model_artifacts}}
-            # If artifacts are a tar.gz, extract to S3 first (Bedrock requires uncompressed format)
             if self.s3_model_artifacts.endswith(".tar.gz") or self.s3_model_artifacts.endswith(".tar.gz/"):
                 extracted_uri = self._extract_tar_gz_to_s3(self.s3_model_artifacts.rstrip("/"))
                 resolved_uri = self._resolve_hf_model_path(extracted_uri)
                 model_data_source = {"s3DataSource": {"s3Uri": resolved_uri}}
-            # Auto-generate job_name if not provided
             if not job_name:
-                import time
                 job_name = f"{imported_model_name or 'import'}-{int(time.time())}"
             params = {
                 "jobName": job_name,
@@ -294,18 +333,12 @@ class BedrockModelBuilder:
             params = {k: v for k, v in params.items() if v is not None}
 
             logger.info("Creating model import job for OSS model deployment")
-            print(f"[BedrockModelBuilder] Resolved S3 artifacts path: {self.s3_model_artifacts}")
-            print(f"[BedrockModelBuilder] create_model_import_job params: {params}")
             import_response = self._get_bedrock_client().create_model_import_job(**params)
-            logger.warning(
-                "Bedrock create_model_import_job request: %s, response: %s", params, import_response
-            )
             _log_bedrock_api_call("create_model_import_job", params, import_response)
 
             job_arn = import_response.get("jobArn")
             self._wait_for_import_job_complete(job_arn)
 
-            # Return the completed job details and store imported model ID
             job_details = self._get_bedrock_client().get_model_import_job(
                 jobIdentifier=job_arn
             )
@@ -573,6 +606,398 @@ class BedrockModelBuilder:
             f"Last status: {status}"
         )
 
+    def _resolve_escrow_identifier(self) -> Optional[str]:
+        """Determine the escrow identifier from the model source.
+
+        Resolution order:
+        1. Model package ARN (for RMP or model_package-based models)
+        2. Checkpoint URI from manifest (for Nova TrainingJob models)
+        3. S3 artifact path (for direct S3 URI or training job output)
+
+        Returns:
+            Escrow identifier string, or None if cannot be determined.
+        """
+        if self.model_package and hasattr(self.model_package, "model_package_arn"):
+            arn = self.model_package.model_package_arn
+            if arn:
+                return arn
+        if self.s3_model_artifacts:
+            if isinstance(self.model, TrainingJob):
+                try:
+                    checkpoint_uri = self._get_checkpoint_uri_from_manifest()
+                    if checkpoint_uri:
+                        return checkpoint_uri
+                except Exception:
+                    pass
+            return self.s3_model_artifacts
+        return None
+
+    def _find_existing_model_by_escrow(self, escrow_identifier: str) -> Optional[str]:
+        """Query ResourceGroupsTaggingAPI for an existing model with matching escrow tag.
+
+        Args:
+            escrow_identifier: Raw escrow URI (will be normalized internally).
+
+        Returns:
+            Model ARN if an Active model is found, None otherwise.
+
+        Raises:
+            TimeoutError: If a Creating model doesn't reach Active within 900s.
+        """
+        try:
+            tagging_client = self.boto_session.client("resourcegroupstaggingapi")
+            normalized_value = normalize_escrow_tag_value(escrow_identifier)
+            response = tagging_client.get_resources(
+                TagFilters=[{"Key": ESCROW_URI_TAG_KEY, "Values": [normalized_value]}],
+                ResourceTypeFilters=["bedrock:custom-model"],
+            )
+        except Exception as e:
+            logger.warning("Could not query ResourceGroupsTaggingAPI: %s. Proceeding without.", e)
+            return None
+
+        resources = response.get("ResourceTagMappingList", [])
+        if not resources:
+            return None
+
+        model_arn = resources[0].get("ResourceARN")
+        if not model_arn:
+            return None
+
+        try:
+            bedrock_client = self._get_bedrock_client()
+            resp = bedrock_client.get_custom_model(modelIdentifier=model_arn)
+            status = resp.get("modelStatus")
+        except Exception as e:
+            logger.warning(
+                "Could not get status for model %s: %s. Proceeding without.", model_arn, e
+            )
+            return None
+
+        if status == "Active":
+            return model_arn
+
+        if status == "Failed":
+            logger.warning("Existing model %s is in Failed status. Will create a new model.", model_arn)
+            return None
+
+        if status == "Creating":
+            elapsed = 0
+            poll_interval = 30
+            max_wait = 900
+            while elapsed < max_wait:
+                time.sleep(poll_interval)
+                elapsed += poll_interval
+                try:
+                    resp = bedrock_client.get_custom_model(modelIdentifier=model_arn)
+                    status = resp.get("modelStatus")
+                except Exception as e:
+                    logger.warning(
+                        "Error polling model %s status: %s. Proceeding without.", model_arn, e
+                    )
+                    return None
+                if status == "Active":
+                    return model_arn
+                if status == "Failed":
+                    logger.warning(
+                        "Model %s transitioned to Failed while waiting. Will create a new model.",
+                        model_arn,
+                    )
+                    return None
+            raise TimeoutError(
+                f"Model {model_arn} did not reach Active status within {max_wait}s."
+            )
+
+        logger.warning("Model %s has unexpected status '%s'. Proceeding without.", model_arn, status)
+        return None
+
+    def _find_or_create_model(
+        self,
+        custom_model_name: str,
+        role_arn: str,
+        model_tags: Optional[list],
+        skip_model_reuse: bool,
+    ) -> str:
+        """Find existing model via escrow tag or create a new one.
+
+        Args:
+            custom_model_name: Name for the custom model (if creating new).
+            role_arn: IAM role ARN for model creation.
+            model_tags: Additional tags for the model.
+            skip_model_reuse: If True, skip escrow lookup.
+
+        Returns:
+            Model ARN (either existing or newly created).
+        """
+        escrow_id = self._resolve_escrow_identifier()
+
+        if not skip_model_reuse and escrow_id:
+            existing_arn = self._find_existing_model_by_escrow(escrow_id)
+            if existing_arn:
+                logger.info("Reusing existing model %s via escrow tag.", existing_arn)
+                return existing_arn
+
+        tags = list(model_tags) if model_tags else []
+        if escrow_id:
+            normalized_value = normalize_escrow_tag_value(escrow_id)
+            tags = [t for t in tags if t.get("key") != ESCROW_URI_TAG_KEY]
+            tags.append({"key": ESCROW_URI_TAG_KEY, "value": normalized_value})
+
+        spec = (
+            getattr(self.model_package, "inference_specification", None)
+            if self.model_package
+            else None
+        )
+        containers = getattr(spec, "containers", None) if spec else None
+        container = containers[0] if containers else None
+        is_nova = _is_nova_model(container) if container else False
+
+        if not self.model_package and self.s3_model_artifacts:
+            is_nova = True
+
+        if self._is_rmp or is_nova:
+            if self._is_rmp:
+                params = {
+                    "modelName": custom_model_name,
+                    "customModelDataSource": {
+                        "modelPackageArnDataSource": {
+                            "modelPackageArn": self.model_package.model_package_arn
+                        }
+                    },
+                    "roleArn": role_arn,
+                }
+            else:
+                s3_uri = self.s3_model_artifacts
+                if isinstance(self.model, TrainingJob):
+                    try:
+                        checkpoint_uri = self._get_checkpoint_uri_from_manifest()
+                        if checkpoint_uri:
+                            s3_uri = checkpoint_uri
+                    except Exception as e:
+                        logger.warning(
+                            "Could not resolve checkpoint from manifest: %s. "
+                            "Using s3_model_artifacts path.", e
+                        )
+                params = {
+                    "modelName": custom_model_name,
+                    "modelSourceConfig": {
+                        "s3DataSource": {"s3Uri": s3_uri}
+                    },
+                    "roleArn": role_arn,
+                }
+            if tags:
+                params["modelTags"] = tags
+            params = {k: v for k, v in params.items() if v is not None}
+
+            logger.info("Creating custom model %s", custom_model_name)
+            response = self._get_bedrock_client().create_custom_model(**params)
+            _log_bedrock_api_call("create_custom_model", params, response)
+            model_arn = response.get("modelArn")
+            self._wait_for_model_active(model_arn)
+            return model_arn
+        else:
+            model_data_source = {"s3DataSource": {"s3Uri": self.s3_model_artifacts}}
+            if self.s3_model_artifacts.endswith(
+                ".tar.gz"
+            ) or self.s3_model_artifacts.endswith(".tar.gz/"):
+                extracted_uri = self._extract_tar_gz_to_s3(
+                    self.s3_model_artifacts.rstrip("/")
+                )
+                resolved_uri = self._resolve_hf_model_path(extracted_uri)
+                model_data_source = {"s3DataSource": {"s3Uri": resolved_uri}}
+
+            job_name = f"{custom_model_name}-import-{int(time.time())}"
+            params = {
+                "jobName": job_name,
+                "importedModelName": custom_model_name,
+                "roleArn": role_arn,
+                "modelDataSource": model_data_source,
+            }
+            if tags:
+                params["importedModelTags"] = tags
+            params = {k: v for k, v in params.items() if v is not None}
+
+            logger.info("Creating model import job for %s", custom_model_name)
+            response = self._get_bedrock_client().create_model_import_job(**params)
+            _log_bedrock_api_call("create_model_import_job", params, response)
+
+            job_arn = response.get("jobArn")
+            self._wait_for_import_job_complete(job_arn)
+
+            job_details = self._get_bedrock_client().get_model_import_job(
+                jobIdentifier=job_arn
+            )
+            return job_details.get("importedModelArn")
+
+    def _check_existing_deployment(
+        self,
+        deployment_name: str,
+        is_provisioned: bool,
+    ) -> Optional[str]:
+        """Check if a deployment with the given name already exists.
+
+        Args:
+            deployment_name: Name to search for.
+            is_provisioned: True for PT, False for OD.
+
+        Returns:
+            Existing deployment ARN if found with exact name match, None otherwise.
+        """
+        try:
+            bedrock_client = self._get_bedrock_client()
+            if is_provisioned:
+                response = bedrock_client.list_provisioned_model_throughputs(
+                    nameContains=deployment_name
+                )
+                for summary in response.get("provisionedModelSummaries", []):
+                    if summary.get("provisionedModelName") == deployment_name:
+                        return summary.get("provisionedModelArn")
+            else:
+                response = bedrock_client.list_custom_model_deployments(
+                    nameContains=deployment_name
+                )
+                for summary in response.get("customModelDeploymentSummaries", []):
+                    if summary.get("customModelDeploymentName") == deployment_name:
+                        return summary.get("customModelDeploymentArn")
+        except Exception as e:
+            logger.warning(
+                "Could not check for existing deployment '%s': %s. Proceeding without.",
+                deployment_name,
+                e,
+            )
+            return None
+        return None
+
+    def _handle_existing_deployment(
+        self,
+        existing_arn: str,
+        deployment_mode: DeploymentMode,
+        new_model_arn: str,
+        deployment_name: str,
+        is_provisioned: bool,
+    ) -> Optional[Dict[str, Any]]:
+        """Handle conflict with an existing deployment.
+
+        Args:
+            existing_arn: ARN of the existing deployment.
+            deployment_mode: How to handle the conflict.
+            new_model_arn: ARN of the new model to deploy.
+            deployment_name: Name of the deployment.
+            is_provisioned: True for PT, False for OD.
+
+        Returns:
+            Result dict if deployment was updated in-place.
+
+        Raises:
+            RuntimeError: If FAIL_IF_EXISTS and deployment exists, or update fails.
+            ValueError: If UPDATE_IF_EXISTS on non-PT deployment.
+        """
+        if deployment_mode == DeploymentMode.FAIL_IF_EXISTS:
+            raise RuntimeError(
+                f"Deployment '{deployment_name}' already exists (ARN: {existing_arn}). "
+                f"Use deployment_mode=UPDATE_IF_EXISTS to update in-place."
+            )
+
+        if not is_provisioned:
+            raise ValueError(
+                "In-place update is only supported for Provisioned Throughput deployments."
+            )
+
+        try:
+            bedrock_client = self._get_bedrock_client()
+            bedrock_client.update_provisioned_model_throughput(
+                provisionedModelId=existing_arn,
+                desiredModelId=new_model_arn,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to update deployment '{deployment_name}': {e}"
+            ) from e
+
+        return {
+            "provisionedModelArn": existing_arn,
+            "modelArn": existing_arn,
+            "customModelArn": new_model_arn,
+            "status": "Updating",
+        }
+
+    def _create_and_poll_provisioned_throughput(
+        self,
+        model_arn: str,
+        deployment_name: str,
+        units: int,
+        commitment_duration: Optional[str],
+        poll_interval: int = 60,
+        max_wait: int = 3600,
+    ) -> Dict[str, Any]:
+        """Create a provisioned throughput deployment and poll until InService.
+
+        Args:
+            model_arn: Custom model ARN to deploy.
+            deployment_name: Name for the provisioned throughput resource.
+            units: Number of model units.
+            commitment_duration: Optional commitment ("OneMonth" or "SixMonths").
+            poll_interval: Seconds between polls. Capped at 60.
+            max_wait: Maximum wait time in seconds.
+
+        Returns:
+            Dict with provisionedModelArn, modelArn, customModelArn, status.
+
+        Raises:
+            RuntimeError: If deployment fails or times out.
+        """
+        params = {
+            "modelId": model_arn,
+            "provisionedModelName": deployment_name,
+            "modelUnits": units,
+        }
+        if commitment_duration is not None:
+            params["commitmentDuration"] = commitment_duration
+
+        logger.info(
+            "Creating provisioned throughput '%s' for model %s with %d units",
+            deployment_name,
+            model_arn,
+            units,
+        )
+        response = self._get_bedrock_client().create_provisioned_model_throughput(**params)
+        _log_bedrock_api_call("create_provisioned_model_throughput", params, response)
+
+        provisioned_model_arn = response.get("provisionedModelArn")
+
+        elapsed = 0
+        status = None
+        while elapsed < max_wait:
+            resp = self._get_bedrock_client().get_provisioned_model_throughput(
+                provisionedModelId=provisioned_model_arn
+            )
+            status = resp.get("status")
+            logger.info(
+                "Provisioned throughput '%s' status: %s (elapsed %ds)",
+                deployment_name,
+                status,
+                elapsed,
+            )
+            if status == "InService":
+                return {
+                    "provisionedModelArn": provisioned_model_arn,
+                    "modelArn": provisioned_model_arn,
+                    "customModelArn": model_arn,
+                    "status": status,
+                }
+            if status == "Failed":
+                failure_reason = resp.get("failureMessage", "Unknown")
+                raise RuntimeError(
+                    f"Provisioned throughput '{deployment_name}' failed. "
+                    f"Reason: {failure_reason}"
+                )
+            time.sleep(min(poll_interval, 60))
+            elapsed += min(poll_interval, 60)
+
+        raise RuntimeError(
+            f"Timed out after {max_wait}s waiting for provisioned throughput "
+            f"'{deployment_name}' to become InService. Last status: {status}"
+        )
+
     def _fetch_model_package(self) -> Optional[ModelPackage]:
         """Fetch the ModelPackage from the provided model.
 
@@ -804,10 +1229,9 @@ class BedrockModelBuilder:
     def _get_checkpoint_uri_from_manifest(self) -> Optional[str]:
         """Get checkpoint URI from manifest.json for Nova models.
 
-        Steps:
-        1. Build the manifest.json path from the training job output_data_config
-        2. Read and parse manifest.json
-        3. Return checkpoint_s3_bucket value
+        Resolution order:
+        1. Try reading manifest.json directly at output/output/manifest.json (serverless)
+        2. If not found, download output/output.tar.gz and extract manifest.json (SMTJ)
 
         Returns:
             Checkpoint URI from manifest.json.
@@ -819,46 +1243,63 @@ class BedrockModelBuilder:
         if not isinstance(self.model, TrainingJob):
             raise ValueError("Model must be a TrainingJob instance for Nova models")
 
-        # Nova serverless training jobs have no model_artifacts; the manifest
-        # lives under the job's output_data_config path.
         output_data_config = getattr(self.model, "output_data_config", None)
         s3_output_path = getattr(output_data_config, "s3_output_path", None)
         if not s3_output_path:
             raise ValueError("No S3 output path found in training job output_data_config")
 
         output_path = s3_output_path.rstrip("/")
-        manifest_path = f"{output_path}/{self.model.training_job_name}/output/output/manifest.json"
+        job_name = self.model.training_job_name
 
-        logger.info("Manifest path: %s", manifest_path)
+        s3_client = self.boto_session.client("s3")
 
+        # Try serverless format: output/output/manifest.json as raw file
+        manifest_path = f"{output_path}/{job_name}/output/output/manifest.json"
         parsed = urlparse(manifest_path)
         bucket = parsed.netloc
         manifest_key = parsed.path.lstrip("/")
 
         logger.info("Looking for manifest at s3://%s/%s", bucket, manifest_key)
 
-        s3_client = self.boto_session.client("s3")
+        manifest = None
         try:
             response = s3_client.get_object(Bucket=bucket, Key=manifest_key)
             manifest = json.loads(response["Body"].read().decode("utf-8"))
-            logger.info("Manifest content: %s", manifest)
+        except Exception:
+            logger.info("Raw manifest.json not found, trying output.tar.gz")
 
-            checkpoint_uri = manifest.get("checkpoint_s3_bucket")
-            if not checkpoint_uri:
+        # Try SMTJ format: manifest.json inside output.tar.gz
+        if manifest is None:
+            import tarfile
+            import tempfile
+            tar_key = f"{output_path}/{job_name}/output/output.tar.gz".replace(
+                f"s3://{bucket}/", ""
+            )
+            tar_key = parsed.path.lstrip("/").rsplit("/manifest.json", 1)[0].rsplit("/output", 1)[0]
+            tar_key = f"{tar_key}/output.tar.gz"
+
+            logger.info("Looking for output.tar.gz at s3://%s/%s", bucket, tar_key)
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".tar.gz") as tmp_file:
+                    s3_client.download_file(bucket, tar_key, tmp_file.name)
+                    with tarfile.open(tmp_file.name, "r:gz") as tar:
+                        manifest_file = tar.extractfile("manifest.json")
+                        if manifest_file is None:
+                            raise ValueError("manifest.json not found inside output.tar.gz")
+                        manifest = json.loads(manifest_file.read().decode("utf-8"))
+            except Exception as e:
                 raise ValueError(
-                    "'checkpoint_s3_bucket' not found in manifest. "
-                    "Available keys: %s" % list(manifest.keys())
+                    f"manifest.json not found at s3://{bucket}/{manifest_key} "
+                    f"and could not extract from output.tar.gz: {e}"
                 )
 
-            logger.info("Checkpoint URI: %s", checkpoint_uri)
-            return checkpoint_uri
-        except s3_client.exceptions.NoSuchKey:
+        logger.info("Manifest content: %s", manifest)
+        checkpoint_uri = manifest.get("checkpoint_s3_bucket")
+        if not checkpoint_uri:
             raise ValueError(
-                "manifest.json not found at s3://%s/%s" % (bucket, manifest_key)
+                "'checkpoint_s3_bucket' not found in manifest. "
+                "Available keys: %s" % list(manifest.keys())
             )
-        except json.JSONDecodeError as e:
-            raise ValueError("Failed to parse manifest.json: %s" % e)
-        except ValueError:
-            raise
-        except Exception as e:
-            raise ValueError("Error reading manifest.json: %s" % e)
+
+        logger.info("Checkpoint URI: %s", checkpoint_uri)
+        return checkpoint_uri
