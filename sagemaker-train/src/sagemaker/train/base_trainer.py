@@ -29,6 +29,7 @@ from sagemaker.train.common_utils.finetune_utils import (
     _validate_hyperparameter_values,
     _get_smhp_replicas_enum,
 )
+from sagemaker.train.common_utils.data_utils import validate_data_path_exists
 from sagemaker.train.common_utils.mlflow_config_utils import resolve_mlflow_tracking_fields
 from sagemaker.train.common_utils.validator import validate_hyperpod_compute
 from sagemaker.train.defaults import TrainDefaults
@@ -284,7 +285,7 @@ class BaseTrainer(ABC):
         return smhp_replicas_enum
 
     @abstractmethod
-    def train(self, input_data_config: List[InputData], wait: bool = True, logs: bool = True, wait_timeout: Optional[int] = None):
+    def train(self, input_data_config: List[InputData], wait: bool = True, logs: bool = True, wait_timeout: Optional[int] = None, dry_run: bool = False):
         """Common training method that calls the specific implementation."""
         pass
 
@@ -300,7 +301,7 @@ class BaseTrainer(ABC):
         return {}
 
     def _train_serverful_smtj(self, training_dataset=None, validation_dataset=None,
-                    wait=True, wait_timeout=None, poll=5):
+                    wait=True, wait_timeout=None, poll=5, dry_run=False):
         """Execute training on serverful SageMaker Training Job (SMTJ) compute.
 
         Uses ModelTrainer.from_recipe() with the model's recipe template from
@@ -653,6 +654,20 @@ class BaseTrainer(ABC):
             base_job_name=base_job_name,
         )
 
+        # Validate data paths exist before submission
+        if resolved_training_dataset:
+            validate_data_path_exists(
+                resolved_training_dataset, sagemaker_session, label="training dataset"
+            )
+        if resolved_validation_dataset:
+            validate_data_path_exists(
+                resolved_validation_dataset, sagemaker_session, label="validation dataset"
+            )
+
+        if dry_run:
+            logger.info("Dry-run validation passed. No job submitted.")
+            return None
+
         # Execute training
         model_trainer.train(
             wait=wait,
@@ -771,7 +786,7 @@ class BaseTrainer(ABC):
         return checkpoint_path
 
     def _train_hyperpod(self, training_dataset=None, validation_dataset=None,
-                        wait=True, wait_timeout=None, poll=5):
+                        wait=True, wait_timeout=None, poll=5, dry_run=False):
         """Execute training on a SageMaker HyperPod cluster.
 
         Uses the HyperPod CLI to connect to the cluster and submit a training job
@@ -913,6 +928,20 @@ class BaseTrainer(ABC):
             override_parameters["container"] = training_image
         if getattr(self, 'model_source', None):
             override_parameters["recipes.run.model_name_or_path"] = self.model_source
+
+        # Validate data paths exist before submission
+        if resolved_training_dataset:
+            validate_data_path_exists(
+                resolved_training_dataset, sagemaker_session, label="training dataset"
+            )
+        if resolved_validation_dataset:
+            validate_data_path_exists(
+                resolved_validation_dataset, sagemaker_session, label="validation dataset"
+            )
+
+        if dry_run:
+            logger.info("Dry-run validation passed. No job submitted.")
+            return None
 
         # Submit job
         start_job_cmd = [

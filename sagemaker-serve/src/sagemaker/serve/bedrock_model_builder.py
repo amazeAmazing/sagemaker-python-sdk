@@ -177,6 +177,7 @@ class BedrockModelBuilder:
         deployment_name: Optional[str] = None,
         target: Optional["BedrockTarget"] = None,
         skip_model_reuse: bool = False,
+        dry_run: bool = False,
     ) -> Dict[str, Any]:
         """Deploy the model to Bedrock.
 
@@ -247,6 +248,17 @@ class BedrockModelBuilder:
                 sagemaker_session=self.sagemaker_session,
             )
 
+            # Validate S3 model artifacts path
+            if self.s3_model_artifacts:
+                from sagemaker.train.common_utils.data_utils import validate_data_path_exists
+                validate_data_path_exists(
+                    self.s3_model_artifacts, self.sagemaker_session, label="model artifacts"
+                )
+
+            if dry_run:
+                logger.info("Dry-run validation passed. No deployment submitted.")
+                return None
+
             is_provisioned = target.mode == "provisioned" if target else False
             config = target.config if target and is_provisioned else None
             effective_skip = skip_model_reuse or (target.skip_model_reuse if target else False)
@@ -313,6 +325,18 @@ class BedrockModelBuilder:
                 role_type="bedrock",
                 sagemaker_session=self.sagemaker_session,
             )
+
+            # Validate S3 model artifacts path
+            if self.s3_model_artifacts:
+                from sagemaker.train.common_utils.data_utils import validate_data_path_exists
+                validate_data_path_exists(
+                    self.s3_model_artifacts, self.sagemaker_session, label="model artifacts"
+                )
+
+            if dry_run:
+                logger.info("Dry-run validation passed. No deployment submitted.")
+                return None
+
             model_data_source = {"s3DataSource": {"s3Uri": self.s3_model_artifacts}}
             if self.s3_model_artifacts.endswith(".tar.gz") or self.s3_model_artifacts.endswith(".tar.gz/"):
                 extracted_uri = self._extract_tar_gz_to_s3(self.s3_model_artifacts.rstrip("/"))
